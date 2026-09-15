@@ -4,3 +4,4 @@ __pycache__/
 data/report_latest.html
 data/_body_tmp.html
 .env
+.claude/
