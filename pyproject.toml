@@ -1,0 +1,13 @@
+[project]
+name = "jobnewslite"
+version = "0.1.0"
+description = "채용뉴스 파인더 - 로컬 실행, WebSearch 기반, 이메일 발송 없음"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk>=0.2.144",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+package = false
