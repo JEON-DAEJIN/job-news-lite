@@ -37,15 +37,27 @@ async def apply_korean_retry_to_scores(
     on_event=None,
 ):
     """추천 이유(reason)가 한국어가 아닌 candidate만 지목해 1회 재요청한다.
-    재요청도 실패하면 원래 result를 그대로 쓴다(런 자체를 죽이지 않음)."""
+    재요청도 실패하면 원래 result를 그대로 쓴다(런 자체를 죽이지 않음).
+
+    반환값은 (result, retry_info) 튜플이다. session_id 동일 여부로 재요청 여부를
+    판단하면 안 된다 — resume은 같은 세션을 이어가므로 성공한 재요청도 session_id가
+    바뀌지 않을 수 있고, 실패한 재요청은 원래 result 객체를 그대로 반환하므로 항상
+    session_id가 같다. 그래서 "시도했는지"와 "고쳤는지"를 별도 값으로 명시적으로
+    반환한다(피어리뷰에서 지적받은 korean_retry 지표 오기록 수정)."""
+    retry_info = {
+        "korean_retry_attempted": False,
+        "korean_retry_fixed": 0,
+        "korean_retry_still_failed": 0,
+    }
     if not result.ok:
-        return result
+        return result, retry_info
 
     scored = result.data.get("scored", [])
     failed = _reason_check_failures(scored)
     if not failed:
-        return result
+        return result, retry_info
 
+    retry_info["korean_retry_attempted"] = True
     if on_event:
         on_event(f"한국어 검사 실패(candidate {failed}) — 추천 이유 재요청 1회")
 
@@ -65,13 +77,16 @@ async def apply_korean_retry_to_scores(
     if not retry.ok:
         if on_event:
             on_event(f"한국어 재요청 실패: {retry.error} (원래 결과로 진행)")
-        return result
+        retry_info["korean_retry_still_failed"] = len(failed)
+        return result, retry_info
 
     still_failed = _reason_check_failures(retry.data.get("scored", []))
+    fixed = len(failed) - len(still_failed)
+    retry_info["korean_retry_fixed"] = fixed
+    retry_info["korean_retry_still_failed"] = len(still_failed)
     if on_event:
-        fixed = len(failed) - len(still_failed)
         msg = f"한국어 재요청 완료 — {len(failed)}건 중 {fixed}건 교정됨"
         if still_failed:
             msg += f", {len(still_failed)}건은 재요청 후에도 미흡"
         on_event(msg)
-    return retry
+    return retry, retry_info

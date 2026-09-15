@@ -111,10 +111,17 @@ def dedup_candidates(candidates: list[dict]) -> tuple[list[dict], dict]:
 
 
 def stage_select(candidates: list[dict]) -> tuple[list[dict], dict]:
-    """1~2차 키워드 게이트. audience.yaml에서 로드된 키워드를 rules.py가 그대로 쓴다."""
+    """1~2차 키워드 게이트. audience.yaml에서 로드된 키워드를 rules.py가 그대로 쓴다.
+
+    title/summary뿐 아니라 confirmed_facts도 게이트 본문에 포함한다 — confirmed_facts는
+    WebFetch로 원문을 직접 확인한, 이 파이프라인에서 가장 신뢰도 높은 칸인데 여기서
+    빠져 있으면 직급 약어 등이 summary에 우연히 있는지 없는지로 통과 여부가 갈릴 수
+    있다는 걸 피어리뷰로 지적받았다."""
     passed, rejected_ids = [], []
     for c in candidates:
-        if passes_keyword_filter(c.get("title", ""), c.get("summary", "")):
+        facts_text = " ".join(c.get("confirmed_facts", []))
+        body = f"{c.get('summary', '')} {facts_text}"
+        if passes_keyword_filter(c.get("title", ""), body):
             passed.append(c)
         else:
             rejected_ids.append(c["candidate_id"])
@@ -148,22 +155,27 @@ def _score_prompt(audience: dict, candidates: list[dict]) -> str:
 async def stage_summarize(
     candidates: list[dict], audience: dict, on_event=None
 ) -> tuple[dict, dict]:
+    empty_retry_info = {
+        "korean_retry_attempted": False,
+        "korean_retry_fixed": 0,
+        "korean_retry_still_failed": 0,
+    }
     if not candidates:
-        return {}, {"score_error": None, "korean_retry": False}
+        return {}, {"score_error": None, **empty_retry_info}
 
     prompt = _score_prompt(audience, candidates)
     result = await run_structured_query(prompt, SCORE_SCHEMA, model=MODEL, tools=[])
-    retried = False
+    retry_info = empty_retry_info
     if result.ok:
-        before_session = result.session_id
-        result = await apply_korean_retry_to_scores(prompt, MODEL, result, on_event=on_event)
-        retried = result.session_id != before_session
+        result, retry_info = await apply_korean_retry_to_scores(
+            prompt, MODEL, result, on_event=on_event
+        )
 
     if not result.ok:
-        return {}, {"score_error": result.error, "korean_retry": retried}
+        return {}, {"score_error": result.error, **retry_info}
 
     scores_by_id = {s["candidate_id"]: s for s in result.data.get("scored", [])}
-    return scores_by_id, {"score_error": None, "korean_retry": retried}
+    return scores_by_id, {"score_error": None, **retry_info}
 
 
 # ---------- 4단계: 검수(Verify) — 할루시네이션/오류 검증 + 예외 처리 ----------
@@ -185,15 +197,31 @@ def _is_past_deadline(deadline_text: str, today: date) -> bool:
         return False
 
 
+def _is_stale(date_text: str, today: date, recency_days: int) -> bool:
+    """audience.yaml의 recency_days는 지금까지 수집 프롬프트의 "부탁"으로만 지켜졌다
+    (피어리뷰 지적) — 게시일(date)이 recency_days를 실제로 넘겼는지 코드로도 확인한다.
+    _is_past_deadline과 같은 정책: 파싱 불가는 보수적으로 통과시킨다."""
+    m = _DATE_RE.search(date_text or "")
+    if not m:
+        return False
+    try:
+        y, mo, d = (int(x) for x in m.groups())
+        return (today - date(y, mo, d)).days > recency_days
+    except ValueError:
+        return False
+
+
 def stage_verify(
     candidates: list[dict], scores_by_id: dict, audience: dict
 ) -> tuple[list[dict], dict]:
-    """점수를 못 받은 후보(할루시네이션 검증 실패로 간주)와 마감일이 지난 후보는
-    스킵(예외 처리)하고, 나머지만 임계치로 최종 통과 여부를 가른다."""
+    """점수를 못 받은 후보(할루시네이션 검증 실패로 간주), 마감일이 지난 후보,
+    게시일이 recency_days를 넘긴 후보는 스킵(예외 처리)하고, 나머지만 임계치로
+    최종 통과 여부를 가른다."""
     today = date.today()
     threshold = audience["score_threshold"]
+    recency_days = audience["recency_days"]
 
-    merged, skipped_no_score, skipped_expired = [], [], []
+    merged, skipped_no_score, skipped_expired, skipped_stale = [], [], [], []
     for c in candidates:
         s = scores_by_id.get(c["candidate_id"])
         if s is None:
@@ -201,6 +229,9 @@ def stage_verify(
             continue
         if _is_past_deadline(c.get("deadline", ""), today):
             skipped_expired.append(c["candidate_id"])
+            continue
+        if _is_stale(c.get("date", ""), today, recency_days):
+            skipped_stale.append(c["candidate_id"])
             continue
         merged.append({**c, "score": s["score"], "reason": s["reason"]})
 
@@ -211,6 +242,7 @@ def stage_verify(
         "verify_input": len(candidates),
         "skipped_no_score": skipped_no_score,
         "skipped_expired_deadline": skipped_expired,
+        "skipped_stale": skipped_stale,
         "below_threshold": len(merged) - len(passed),
         "final_passed": len(passed),
     }
@@ -220,12 +252,16 @@ def stage_verify(
 # ---------- 5단계: 발행(Publish) ----------
 
 
-def stage_publish(passed: list[dict], report_path: Path) -> dict:
+def stage_publish(
+    passed: list[dict], report_path: Path, source_summary: list[dict] | None = None
+) -> dict:
     public_jobs = [j for j in passed if j.get("category") == "public"]
     company_jobs = [j for j in passed if j.get("category") == "company"]
     title_warnings = title_language_warnings(passed)
 
-    body = build_report_body(public_jobs, company_jobs, title_warnings=title_warnings)
+    body = build_report_body(
+        public_jobs, company_jobs, title_warnings=title_warnings, source_summary=source_summary
+    )
     write_report(body, report_path)
 
     return {
